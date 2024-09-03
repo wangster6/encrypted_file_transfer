@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+
+# Author: Ray Wang (rwang32)
+# CSC 574 Mini-Project 1
+# eft: encrypted file transfer
+
+# Import additional modules as needed.
+import argparse
+import sys
+import socket
+from Crypto.Random import get_random_bytes
+from Crypto.Protocol.KDF import PBKDF2
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad
+from Crypto.Util.Padding import unpad
+from base64 import b64encode
+from base64 import b64decode
+
+
+def print_debug(*objects, sep=' ', end='\n', file=sys.stderr, flush=False):
+    """
+    When stdout is redirected, messages cannot be printed to stdout as they will be written to the file, not the console.
+    Use this function to print debug messages to stderr.
+    It supports all optional arguments of the print function, with the exception that file is overridden to stderr.
+
+    IMPORTANT: This function cannot be used to display debug messages in the autograder environment.
+
+    :param objects: Any non-keyword argument that can be converted to string.
+    :param sep: String to separate objects. [Default: Space]
+    :param end: String to append to the end. [Default: Newline]
+    :param file: Not used. Overridden to sys.stderr.
+    :param flush: Forcibly flush the stream.
+    """
+
+    print(objects, sep=sep, end=end, file=sys.stderr, flush=flush)
+
+
+def read_file(buffer_len):
+    """
+    Wrapper function for reading from stdin.
+    Use < to redirect a file to stdin.
+
+    :param buffer_len: Number of bytes to read at once.
+    :return: Raw bytes or None if buffer is empty.
+    """
+
+    return sys.stdin.buffer.read(buffer_len)
+
+
+def write_file(data):
+    """
+    Wrapper function for writing a file to stdout.
+    Use > to redirect stdout to a file.
+
+    :param data: raw bytes.
+    """
+
+    sys.stdout.buffer.write(data)
+
+
+def server(port, plain_key):
+    """
+    Server Code
+
+    :param port: Port number to listen on.
+    :param plain_key: Plain text decryption key.
+    """
+
+    # create an INET, STREAMing socket
+    serversocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # bind the socket to a public host, and a well-known port
+    serversocket.bind(('', port))
+    # become a server socket
+    serversocket.listen(1) # to only allow 1 connection at a time
+
+    # accept connections from outside
+    (clientsocket, address) = serversocket.accept()
+    
+    # receive the salt from the client
+    salt = clientsocket.recv(16)
+    
+    # PBKDF2 key derivation
+    key = PBKDF2(plain_key, salt, dkLen=32)
+
+    chunks = [] # empty list to store chunks of file data
+    bytes_received = 0
+    while bytes_received < 65535: # loop until max limit of 65535 bytes is reached
+        length_bytes = clientsocket.recv(2) # receive first 2 bytes of message to get length of chunk
+        if not length_bytes: # if no length received, exit loop
+            break
+        
+        length = int.from_bytes(length_bytes, byteorder='big') # convert length to integer
+        
+        nonce = clientsocket.recv(16) # receive nonce
+        tag = clientsocket.recv(16) # receive tag
+        ciphertext = clientsocket.recv(length - 32) # receive chunk of file data        
+        
+        # pulled from pycryptodome documentation and slightly modified
+        try:
+            cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+            plaintext = cipher.decrypt_and_verify(ciphertext, tag)
+            # decoded = plaintext.decode('utf-8')
+            
+            unpadded = unpad(plaintext, 16, style='pkcs7')
+            
+            chunks.append(unpadded) # append chunk to list
+            bytes_received += (len(ciphertext) + 32) # update total bytes count    
+        except Exception as e:
+            sys.stderr.write("Error: integrity check failed.\n")
+            sys.exit()
+    
+    file_data = b''.join(chunks)
+    write_file(file_data) # write file data to stdout
+    # sys.stdout.flush() # flush stdout
+
+    # Clean up the connection and socket
+    clientsocket.close()
+    serversocket.close()
+
+def client(addr, port, plain_key):
+    """
+    Client Code
+
+    :param addr: IP address of the server.
+    :param port: Port to connect to.
+    :param plain_key: Plain text encryption key.
+    :return:
+    """
+    
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    
+    try:
+        # connect socket to server's address and port
+        s.connect((addr, port))
+        # print_debug("Connected to server")
+        
+        buffer_len = 1024
+    
+        # generate a random salt
+        salt = get_random_bytes(16)
+        # print_debug("Salt: " + str(salt))
+        
+        # send the salt to the server
+        s.sendall(salt)
+        
+        # PBKDF2 key derivation
+        key = PBKDF2(plain_key, salt, dkLen=32)
+        # print_debug("Key: " + str(key))
+                
+        while True:
+            chunk = read_file(buffer_len)
+            if not chunk:
+                break
+            
+            padded = pad(chunk, 16, style='pkcs7')
+            
+            # create a cipher object
+            cipher = AES.new(key, AES.MODE_GCM)
+            
+            # encrypt the padded chunk using cipher object and digest result
+            ciphertext, tag = cipher.encrypt_and_digest(padded)
+            
+            #get nonce (iv) from cipher object
+            nonce = cipher.nonce
+            
+            # send length of the encrypted data
+            length = len(ciphertext) + 32
+            length_bytes = length.to_bytes(2, byteorder='big')
+            pdu = length_bytes + nonce + tag + ciphertext
+            
+            # send file data in chunks
+            # print_debug("Chunks sent: " + str(len(encrypted)))
+            # print_debug("Whats sent: " + str(pdu))
+            s.sendall(pdu)
+        
+    except (ValueError, KeyError):
+        sys.stderr.write("Error: integrity check failed.\n")
+        sys.exit()
+    finally:
+        # print_debug("File sent. Terminating program.")
+        s.close()
+
+
+def parse_args():
+    """
+    Command Line Argument Parser
+
+    :return: Argparse Namespace of identified command line arguments.
+    """
+    
+    # Configure the argument parser.
+    parser = argparse.ArgumentParser(description='Encrypted File Transfer')
+    parser.add_argument('-k', dest='key', action='store', help='Password for key')
+    server_group = parser.add_argument_group('server_group', 'Server mode options')
+    server_group.add_argument('-l', dest='server_port', action='store', help='Server mode with port')
+    client_group = parser.add_argument_group('client_group', 'Client mode options')
+    client_group.add_argument('client_ip_address', nargs='?')
+    client_group.add_argument('client_port', nargs='?')
+
+    # Parse arguments.
+    args = parser.parse_args()
+
+    # Check if arguments are valid.
+    args_ok = ((args.key is not None) and (args.server_port is None) and (args.client_ip_address is not None and args.client_port is not None)) or \
+              ((args.key is not None) and (args.server_port is not None) and (args.client_ip_address is None and args.client_port is None))
+
+    # If not, show usage message and exit.
+    if not args_ok:
+        print("./eft -k KEY [-l SERVER_PORT > OUTPUT FILE] [CLIENT_IP_ADDRESS CLIENT_PORT < INPUT_FILE]")
+        sys.exit(0)
+
+    # Otherwise return the args.
+    return args
+
+
+def main():
+    # Parse Arguments
+    args = parse_args()
+
+    # Launch the client or server depending on the arguments received.
+    plain_key = args.key
+    if args.server_port is not None:
+        port = int(args.server_port)
+        server(port, plain_key)
+    else:
+        addr = args.client_ip_address
+        port = int(args.client_port)
+        client(addr, port, plain_key)
+
+
+if __name__ == "__main__":
+    main()

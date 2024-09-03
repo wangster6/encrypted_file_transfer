@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+
+# Author: <YOUR_NAME_HERE>
+# CSC 574 Mini-Project 1
+# dh-proxy: Diffie-Hellman Man-in-the-Middle proxy
+
+# Import additional modules as needed.
+import argparse
+import sys
+import socket
+import os
+import select
+from base64 import b64encode
+from base64 import b64decode
+from Crypto.Hash import SHA256
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad
+from Crypto.Util.Padding import unpad
+
+# Diffie-Hellman Parameters
+g=2
+p=0x00cc81ea8157352a9e9a318aac4e33ffba80fc8da3373fb44895109e4c3ff6cedcc55c02228fccbd551a504feb4346d2aef47053311ceaba95f6c540b967b9409e9f0502e598cfc71327c5a455e2e807bede1e0b7d23fbea054b951ca964eaecae7ba842ba1fc6818c453bf19eb9c5c86e723e69a210d4b72561cab97b3fb3060b
+
+
+# Note: STDIN and STDOUT are not redirected in this program so the use of this print wrapper is optional.
+def print_debug(*objects, sep=' ', end='\n', file=sys.stderr, flush=False):
+    """
+    When stdout is redirected, messages cannot be printed to stdout as they will be written to the file, not the console.
+    Use this function to print debug messages to stderr.
+    It supports all optional arguments of the print function, with the exception that file is overridden to stderr.
+
+    IMPORTANT: This function cannot be used to display debug messages in the autograder environment.
+
+    :param objects: Any non-keyword argument that can be converted to string.
+    :param sep: String to separate objects. [Default: Space]
+    :param end: String to append to the end. [Default: Newline]
+    :param file: Not used. Overridden to sys.stderr.
+    :param flush: Forcibly flush the stream.
+    """
+
+    print(objects, sep=sep, end=end, file=sys.stderr, flush=flush)
+
+
+def write_file(data):
+    """
+    Wrapper function for writing a file to stdout.
+    Use > as the last option to redirect stdout to a file.
+    Other options must be specified on the command line before the redirect operator.
+
+    :param data: raw bytes.
+    """
+
+    sys.stdout.buffer.write(data)
+
+
+def num_to_x_byte_str(num, numbytes):
+    """
+    Converts int to numbytes-byte string with a bunch of 0s in front of it
+    IMPORTANT: This function should NOT be used when creating the string representation of the output of the
+                diffie-hellman key agreement procedure before hashing it. Use create_final_dh_string instead.
+
+
+    :param num: The number to be encoded.
+    :param numbytes:  The total number of bytes the string should take.
+    :return: decimal representation of num padded with zeros.
+    """
+
+    num = str(num)
+    return (numbytes - len(num)) * '0' + num
+
+
+def create_final_dh_string(new_key):
+    """
+    Process the output of the diffie_hellman key into a hex string for use in generating the session key.
+    IMPORTANT: This function should NOT be used when creating the string representation of A and B.
+               Use num_to_x_byte_str instead.
+
+    :param new_key: Diffie-Hellman Key
+    :return: Hex string representation of new_key.
+    """
+
+    # Post-process the created key
+    new_key_str = '%x' % new_key
+    return new_key_str.encode('utf-8')
+
+
+def proxy(server_port, client_ip_address, client_port):
+    """
+    Proxy Code
+
+    :param server_port: Port number for server component of dh-proxy to listen on.
+    :param client_ip_address: Address for client component of dh-proxy to connect to.
+    :param client_port: Port number for client component of dh-proxy to connect to.
+    """
+
+    # pulled from server code
+    serversocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    serversocket.bind(('', int(server_port)))
+    serversocket.listen(5)
+    (clientsocket, address) = serversocket.accept()
+    
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.connect((client_ip_address, int(client_port)))
+    
+    ## client and proxy key exchange
+    y1 = int(clientsocket.recv(384).decode('utf-8'))
+    
+    x2 = int.from_bytes(os.urandom(32), byteorder='big')
+    y2 = pow(g, x2, p)
+
+    clientsocket.sendall(num_to_x_byte_str(y2, 384).encode('utf-8'))
+    
+    k2 = pow(y1, x2, p)
+    # print_debug("k2: " + str(k2))
+    
+    ## proxy and server key exchange
+    x1 = int.from_bytes(os.urandom(32), byteorder='big')
+    y1 = pow(g, x1, p)
+
+    s.sendall(num_to_x_byte_str(y1, 384).encode('utf-8'))
+ 
+    y2 = int(s.recv(384).decode('utf-8'))
+    
+    k1 = pow(y2, x1, p)
+    # print_debug("k1: " + str(k1))
+        
+    server_dh_string = create_final_dh_string(k1)
+    server_session_key = SHA256.new(server_dh_string).digest()[:32]
+    
+    client_dh_string = create_final_dh_string(k2)
+    client_session_key = SHA256.new(client_dh_string).digest()[:32]
+    
+    chunks = [] # empty list to store chunks of file data
+    bytes_received = 0
+    while bytes_received < 65535: # loop until max limit of 65535 bytes is reached
+        length_bytes = clientsocket.recv(2) # receive first 2 bytes of message to get length of chunk
+        if not length_bytes: # if no length received, exit loop
+            break
+        
+        length = int.from_bytes(length_bytes, byteorder='big') # convert length to integer
+        
+        nonce = clientsocket.recv(16) # receive nonce
+        tag = clientsocket.recv(16) # receive tag
+        ciphertext = clientsocket.recv(length - 32) # receive chunk of file data        
+        # print_debug("ciphertext: " + str(ciphertext))
+        # print_debug("tag: " + str(tag))
+        
+        
+        unpadded = ''
+        # pulled from pycryptodome documentation and slightly modified
+        try:
+            cipher = AES.new(client_session_key, AES.MODE_GCM, nonce=nonce)
+            plaintext = cipher.decrypt_and_verify(ciphertext, tag)
+            # decoded = plaintext.decode('utf-8')
+            
+            unpadded = unpad(plaintext, 16, style='pkcs7')
+            
+            chunks.append(unpadded) # append chunk to list
+            bytes_received += (len(ciphertext) + 32) # update total bytes count    
+        except Exception as e:
+            sys.stderr.write("Error: integrity check failed.\n")
+            sys.exit()
+        
+        
+        
+        padded = pad(unpadded, 16, style='pkcs7')
+        cipher = AES.new(server_session_key, AES.MODE_GCM)
+        ciphertext, tag = cipher.encrypt_and_digest(padded)
+        nonce = cipher.nonce
+        length = len(ciphertext) + 32
+        length_bytes = length.to_bytes(2, byteorder='big')
+        
+        pdu = length_bytes + nonce + tag + ciphertext
+        s.sendall(pdu)
+    
+    file_data = b''.join(chunks)
+    write_file(file_data)
+    
+    clientsocket.close()
+    serversocket.close()
+    s.close()
+    
+def parse_args():
+    """
+    Command Line Argument Parser
+
+    :return: Argparse Namespace of identified command line arguments.
+    """
+    
+    # Configure the argument parser.
+    parser = argparse.ArgumentParser(description='Diffie-Hellman Proxy')
+    listen_group = parser.add_argument_group('listen_group', 'Listen options')
+    listen_group.add_argument('-l', dest='server_port', action='store', help='Listen port')
+    connect_group = parser.add_argument_group('connect_group', 'Connect to options')
+    connect_group.add_argument('client_ip_address', nargs='?')
+    connect_group.add_argument('client_port', nargs='?')
+
+    # Parse arguments.
+    args = parser.parse_args()
+
+    # Check if arguments are valid.
+    args_ok = (args.server_port is not None and args.client_ip_address is not None and args.client_port is not None)
+
+    # If not, show usage message and exit.
+    if not args_ok:
+        print("./dh-proxy -l SERVER_PORT CLIENT_IP_ADDRESS CLIENT_PORT > OUTPUT FILE")
+        sys.exit(0)
+
+    # Otherwise return the args.
+    return args
+
+
+def main():
+    # Parse Arguments
+    args = parse_args()
+
+    # Launch the proxy.
+    if args.server_port is not None:
+        proxy(args.server_port, args.client_ip_address, args.client_port)
+
+
+if __name__ == "__main__":
+    main()
